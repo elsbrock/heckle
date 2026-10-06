@@ -16,7 +16,12 @@ pub struct Brain {
 impl Brain {
     pub fn new(key: String, model: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                // between bytes, so a long stream is fine but a stalled one is not
+                .read_timeout(std::time::Duration::from_secs(15))
+                .build()
+                .expect("static client config"),
             key,
             model,
         }
