@@ -1,14 +1,17 @@
 mod brain;
 mod camera;
+mod ipc;
 mod screen;
+mod tray;
 mod voice;
 
 use std::io::Cursor;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand, ValueEnum};
 use image::{ImageFormat, imageops::FilterType};
+use tokio::sync::{mpsc, watch};
 
 const SYSTEM: &str = "You are Sir David Attenborough narrating a nature documentary. The subject is a human \
 at its workstation. You get the screen and, when available, a webcam image of the human. \
@@ -19,6 +22,55 @@ Never read out passwords, tokens or private message contents. \
 If nothing has meaningfully changed, reply exactly: SILENCE";
 
 #[derive(Parser)]
+#[command(about = "Live documentary-style commentator for your screen and webcam")]
+struct Cli {
+    #[command(flatten)]
+    args: Args,
+    /// Control a running daemon; without a subcommand, run the daemon.
+    #[command(subcommand)]
+    cmd: Option<Sub>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SetArg {
+    On,
+    Off,
+    Toggle,
+}
+
+impl From<SetArg> for ipc::Set {
+    fn from(s: SetArg) -> Self {
+        match s {
+            SetArg::On => ipc::Set::On,
+            SetArg::Off => ipc::Set::Off,
+            SetArg::Toggle => ipc::Set::Toggle,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum Sub {
+    /// Narrate what is on screen right now (interrupts current speech).
+    Poke {
+        /// Optional hint to steer the line.
+        hint: Vec<String>,
+    },
+    /// Cut off the current speech.
+    Stop,
+    /// Continuous narration.
+    Auto {
+        set: SetArg,
+    },
+    /// Turn the whole daemon on or off (off also stops the camera).
+    Enable,
+    Disable,
+    /// Flip enabled/disabled; handy as a single hotkey.
+    Toggle,
+    Status,
+    Quit,
+}
+
+#[derive(clap::Args)]
 struct Args {
     #[arg(long, env = "OPENROUTER_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
@@ -27,9 +79,9 @@ struct Args {
     /// Longest edge of the screen frame sent to the model.
     #[arg(long, default_value_t = 768)]
     width: u32,
-    /// Stop after N narrations (0 = run until interrupted).
-    #[arg(long, default_value_t = 0)]
-    repeat: u32,
+    /// Start in continuous mode (default: idle until `narrator poke`).
+    #[arg(long)]
+    auto: bool,
     /// Disable the webcam (screen only).
     #[arg(long)]
     no_camera: bool,
@@ -74,8 +126,64 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "narrator=info".into()),
         )
         .init();
-    let args = Args::parse();
+    let cli = Cli::parse();
+    let line = match cli.cmd {
+        None => return run(cli.args).await,
+        Some(Sub::Poke { hint }) => {
+            ipc::Cmd::Poke((!hint.is_empty()).then(|| hint.join(" "))).wire()
+        }
+        Some(Sub::Stop) => ipc::Cmd::Stop.wire(),
+        Some(Sub::Auto { set }) => ipc::Cmd::Auto(set.into()).wire(),
+        Some(Sub::Enable) => ipc::Cmd::Enabled(ipc::Set::On).wire(),
+        Some(Sub::Disable) => ipc::Cmd::Enabled(ipc::Set::Off).wire(),
+        Some(Sub::Toggle) => ipc::Cmd::Enabled(ipc::Set::Toggle).wire(),
+        Some(Sub::Quit) => ipc::Cmd::Quit.wire(),
+        Some(Sub::Status) => "status".to_string(),
+    };
+    let reply = ipc::send(&line).await?;
+    println!("{reply}");
+    if reply.starts_with("error") {
+        std::process::exit(1);
+    }
+    Ok(())
+}
 
+struct Ctx {
+    brain: brain::Brain,
+    voice: voice::Voice,
+    width: u32,
+}
+
+async fn start_camera(args: &Args) -> Option<camera::Camera> {
+    if args.no_camera {
+        return None;
+    }
+    match camera::Camera::start(args.camera_target.as_deref(), 2) {
+        Ok(c) => {
+            if !c.wait_ready(Duration::from_secs(5)).await {
+                tracing::warn!("no webcam frame within 5s, will keep trying");
+            }
+            Some(c)
+        }
+        Err(e) => {
+            tracing::warn!("camera unavailable, continuing screen-only: {e:#}");
+            None
+        }
+    }
+}
+
+async fn publish(
+    tx: &watch::Sender<ipc::Status>,
+    tray: &Option<ksni::Handle<tray::Tray>>,
+    status: ipc::Status,
+) {
+    let _ = tx.send(status);
+    if let Some(h) = tray {
+        h.update(|t| t.status = status).await;
+    }
+}
+
+async fn run(args: Args) -> Result<()> {
     let dir = args.voice_dir.replacen('~', &std::env::var("HOME")?, 1);
     let t = Instant::now();
     let voice = voice::Voice::new(std::path::Path::new(&dir), args.sid, args.speed)?;
@@ -88,75 +196,163 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let brain = brain::Brain::new(
-        args.api_key.context("OPENROUTER_API_KEY is required")?,
-        args.model,
-    );
-    let camera = if args.no_camera {
-        None
-    } else {
-        match camera::Camera::start(args.camera_target.as_deref(), 2) {
-            Ok(c) => {
-                if !c.wait_ready(Duration::from_secs(5)).await {
-                    tracing::warn!("no webcam frame within 5s, will keep trying");
-                }
-                Some(c)
-            }
-            Err(e) => {
-                tracing::warn!("camera unavailable, continuing screen-only: {e:#}");
-                None
-            }
-        }
+    let ctx = Ctx {
+        brain: brain::Brain::new(
+            args.api_key
+                .clone()
+                .context("OPENROUTER_API_KEY is required")?,
+            args.model.clone(),
+        ),
+        voice,
+        width: args.width,
     };
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<ipc::Cmd>();
+    let mut status = ipc::Status {
+        enabled: true,
+        auto: args.auto,
+    };
+    let (status_tx, status_rx) = watch::channel(status);
+    ipc::serve(tx.clone(), status_rx).await?;
+    let tray = tray::spawn(tx.clone(), status).await;
+    let quit_tx = tx.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        let _ = quit_tx.send(ipc::Cmd::Quit);
+    });
+
+    let mut camera = start_camera(&args).await;
     let lookahead = Duration::from_millis(args.lookahead_ms);
     let mut history: Vec<String> = Vec::new();
-    let mut n = 0;
-    while args.repeat == 0 || n < args.repeat {
-        wait_ready(&voice, lookahead).await;
-        let t = Instant::now();
-        let frame = screen::capture().context("screen capture")?;
-        let mut images = vec![("Screen", to_jpeg(&frame, args.width)?)];
-        if let Some(cam) = &camera {
-            match cam.latest(Duration::from_secs(3)) {
-                Some(jpeg) => images.push(("Webcam", jpeg)),
-                None => tracing::warn!("no fresh webcam frame, sending screen only"),
-            }
-        }
-        tracing::info!(
-            ms = t.elapsed().as_millis() as u64,
-            images = images.len(),
-            "captured+encoded"
-        );
+    let mut queued: Option<ipc::Cmd> = None;
+    let mut not_before = Instant::now(); // backoff for continuous mode
+    tracing::info!(socket = %ipc::socket_path().display(), auto = status.auto, "ready");
 
-        let recent = &history[history.len().saturating_sub(6)..];
-        let (mut line, mut silent) = (String::new(), false);
-        let res = brain
-            .narrate(SYSTEM, recent, &images, |chunk| {
-                if silent || chunk.starts_with("SILENCE") {
-                    silent = true;
-                    return;
+    loop {
+        let cmd = match queued.take() {
+            Some(c) => Some(c),
+            None => tokio::select! {
+                c = rx.recv() => match c { Some(c) => Some(c), None => break },
+                _ = tokio::time::sleep(Duration::from_millis(50)) => None,
+            },
+        };
+        let (hint, manual) = match cmd {
+            Some(ipc::Cmd::Quit) => break,
+            Some(ipc::Cmd::Stop) => {
+                ctx.voice.stop();
+                continue;
+            }
+            Some(ipc::Cmd::Auto(set)) => {
+                status.auto = set.apply(status.auto);
+                publish(&status_tx, &tray, status).await;
+                continue;
+            }
+            Some(ipc::Cmd::Enabled(set)) => {
+                status.enabled = set.apply(status.enabled);
+                ctx.voice.stop();
+                camera = None; // stops the pipeline (and the LED) right away
+                publish(&status_tx, &tray, status).await;
+                if status.enabled {
+                    camera = start_camera(&args).await;
                 }
-                println!("{chunk}");
-                line.push_str(&chunk);
-                line.push(' ');
-                voice.say(chunk);
-            })
-            .await;
-        if let Err(e) = res {
-            tracing::warn!("narration failed: {e:#}");
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            continue;
+                tracing::info!(enabled = status.enabled, "toggled");
+                continue;
+            }
+            Some(ipc::Cmd::Poke(_)) if !status.enabled => continue,
+            Some(ipc::Cmd::Poke(hint)) => {
+                ctx.voice.stop();
+                (hint, true)
+            }
+            None if status.enabled
+                && status.auto
+                && Instant::now() >= not_before
+                && ctx.voice.ready_within(lookahead) =>
+            {
+                (None, false)
+            }
+            None => continue,
+        };
+
+        let instruction = match (&hint, manual) {
+            (Some(h), _) => format!("The viewer asks for a comment right now. Focus: {h}"),
+            (None, true) => {
+                "The viewer asks for a comment right now; do not reply SILENCE.".to_string()
+            }
+            (None, false) => "Narrate now.".to_string(),
+        };
+        let recent = history[history.len().saturating_sub(6)..].to_vec();
+        let outcome = {
+            let fut = narrate(&ctx, camera.as_ref(), &recent, &instruction);
+            tokio::pin!(fut);
+            loop {
+                tokio::select! {
+                    r = &mut fut => break Some(r),
+                    Some(c) = rx.recv() => {
+                        if c.cancels_narration() {
+                            queued = Some(c);
+                            break None; // drops the request in flight
+                        }
+                        if let ipc::Cmd::Auto(set) = c {
+                            status.auto = set.apply(status.auto);
+                            publish(&status_tx, &tray, status).await;
+                        }
+                    }
+                }
+            }
+        };
+        match outcome {
+            Some(Ok(Some(line))) => history.push(line),
+            Some(Ok(None)) => not_before = Instant::now() + Duration::from_secs(3),
+            Some(Err(e)) => {
+                tracing::warn!("narration failed: {e:#}");
+                not_before = Instant::now() + Duration::from_secs(3);
+            }
+            None => {} // cancelled by a command, handled next iteration
         }
-        if silent {
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            continue;
-        }
-        history.push(line.trim().to_string());
-        n += 1;
     }
-    wait_ready(&voice, Duration::ZERO).await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    ctx.voice.stop();
+    let _ = std::fs::remove_file(ipc::socket_path());
     Ok(())
+}
+
+/// One look: capture, ask the model, speak clauses as they stream in.
+/// Returns the spoken line, or `None` if the model chose silence.
+async fn narrate(
+    ctx: &Ctx,
+    camera: Option<&camera::Camera>,
+    recent: &[String],
+    instruction: &str,
+) -> Result<Option<String>> {
+    let t = Instant::now();
+    let frame = screen::capture().context("screen capture")?;
+    let mut images = vec![("Screen", to_jpeg(&frame, ctx.width)?)];
+    if let Some(cam) = camera {
+        match cam.latest(Duration::from_secs(3)) {
+            Some(jpeg) => images.push(("Webcam", jpeg)),
+            None => tracing::warn!("no fresh webcam frame, sending screen only"),
+        }
+    }
+    tracing::info!(
+        ms = t.elapsed().as_millis() as u64,
+        images = images.len(),
+        "captured+encoded"
+    );
+
+    let (mut line, mut silent) = (String::new(), false);
+    ctx.brain
+        .narrate(SYSTEM, recent, &images, instruction, |chunk| {
+            if silent || chunk.starts_with("SILENCE") {
+                silent = true;
+                return;
+            }
+            println!("{chunk}");
+            line.push_str(&chunk);
+            line.push(' ');
+            ctx.voice.say(chunk);
+        })
+        .await?;
+    Ok((!silent).then(|| line.trim().to_string()))
 }
 
 async fn wait_ready(voice: &voice::Voice, lookahead: Duration) {

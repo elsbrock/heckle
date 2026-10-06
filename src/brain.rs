@@ -28,6 +28,7 @@ impl Brain {
         system: &str,
         history: &[String],
         images: &[(&str, Vec<u8>)],
+        instruction: &str,
         mut on_chunk: impl FnMut(String),
     ) -> Result<()> {
         let start = Instant::now();
@@ -41,7 +42,7 @@ impl Brain {
             })
             .collect();
         content.push(json!({"type": "text", "text": format!(
-            "Your previous lines (do not repeat):\n{}\nNarrate now.", history.join("\n"))}));
+            "Your previous lines (do not repeat):\n{}\n{instruction}", history.join("\n"))}));
 
         let resp = self
             .http

@@ -9,13 +9,14 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+ksni = "0.3.6"
 memmap2 = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 rustix = { version = "1", features = ["shm", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sherpa-onnx = "1.13.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util", "net", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wayland-client = "0.31"
