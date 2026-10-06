@@ -239,6 +239,11 @@ async fn run(args: Args) -> Result<()> {
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         let _ = quit_tx.send(ipc::Cmd::Quit);
+        // The loop only sees Quit between steps (e.g. not while a camera is still waking up),
+        // so a second Ctrl+C force-quits.
+        let _ = tokio::signal::ctrl_c().await;
+        let _ = std::fs::remove_file(ipc::socket_path());
+        std::process::exit(130);
     });
 
     let mut camera = start_camera(&args).await;
