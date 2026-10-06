@@ -78,6 +78,10 @@ enum Sub {
 struct Args {
     #[arg(long, env = "OPENROUTER_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
+    /// Shell command that prints the API key (e.g. `op read op://vault/item/field`); used when
+    /// no key is given directly. Without either, `~/.config/narrator/api-key` is read.
+    #[arg(long, env = "NARRATOR_API_KEY_CMD")]
+    api_key_cmd: Option<String>,
     #[arg(long, default_value = "anthropic/claude-haiku-4.5")]
     model: String,
     /// Longest edge of each screen tile sent to the model (Claude downsizes beyond ~1568).
@@ -106,7 +110,11 @@ struct Args {
     #[arg(long)]
     say: Option<String>,
     /// Kokoro model directory.
-    #[arg(long, default_value = "~/.cache/narrator/models/kokoro-en-v0_19")]
+    #[arg(
+        long,
+        env = "NARRATOR_VOICE_DIR",
+        default_value = "~/.cache/narrator/models/kokoro-en-v0_19"
+    )]
     voice_dir: String,
     /// Kokoro speaker id (9 = bm_george, 10 = bm_lewis, 5 = am_adam).
     #[arg(long, default_value_t = 9)]
@@ -293,6 +301,42 @@ async fn publish(
     }
 }
 
+/// The API key from, in order: `--api-key`/env, the key command, the config-dir key file.
+/// Launchers start the daemon without a shell, so the first source is often absent.
+async fn resolve_api_key(args: &Args) -> Result<String> {
+    if let Some(key) = args.api_key.as_deref().filter(|k| !k.trim().is_empty()) {
+        return Ok(key.trim().to_string());
+    }
+    if let Some(cmd) = &args.api_key_cmd {
+        let out = tokio::process::Command::new("sh")
+            .args(["-c", cmd])
+            .output()
+            .await
+            .context("running the API key command")?;
+        anyhow::ensure!(
+            out.status.success(),
+            "API key command failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        let key = String::from_utf8(out.stdout)?.trim().to_string();
+        anyhow::ensure!(!key.is_empty(), "API key command printed nothing");
+        return Ok(key);
+    }
+    let dir = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(d) => std::path::PathBuf::from(d),
+        None => std::path::PathBuf::from(std::env::var("HOME")?).join(".config"),
+    };
+    let path = dir.join("narrator/api-key");
+    std::fs::read_to_string(&path)
+        .map(|k| k.trim().to_string())
+        .with_context(|| {
+            format!(
+                "no API key: set OPENROUTER_API_KEY or NARRATOR_API_KEY_CMD, or put it in {}",
+                path.display()
+            )
+        })
+}
+
 async fn run(args: Args) -> Result<()> {
     let dir = args.voice_dir.replacen('~', &std::env::var("HOME")?, 1);
     let t = Instant::now();
@@ -307,12 +351,7 @@ async fn run(args: Args) -> Result<()> {
     }
 
     let ctx = Ctx {
-        brain: brain::Brain::new(
-            args.api_key
-                .clone()
-                .context("OPENROUTER_API_KEY is required")?,
-            args.model.clone(),
-        ),
+        brain: brain::Brain::new(resolve_api_key(&args).await?, args.model.clone()),
         voice,
         width: args.width,
         tiles: args.tiles,
