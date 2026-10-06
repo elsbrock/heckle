@@ -148,10 +148,12 @@ fn synthesize(
                 tracing::info!(ms = start.elapsed().as_millis() as u64, "first audio chunk");
                 first = false;
             }
+            // Check the epoch under the lock `stop` also takes, so a chunk that loses the race
+            // cannot extend `busy_until` after `stop` reset it.
+            let mut busy = st.busy_until.lock().unwrap();
             if st.epoch.load(Ordering::SeqCst) != epoch {
                 return false; // stopped while synthesizing
             }
-            let mut busy = st.busy_until.lock().unwrap();
             *busy = (*busy).max(Instant::now())
                 + Duration::from_secs_f32(chunk.len() as f32 / rate as f32);
             tx.send(Audio::Chunk(epoch, chunk.to_vec())).is_ok()
@@ -199,7 +201,20 @@ fn pump(
                     continue;
                 }
                 let bytes: Vec<u8> = chunk.iter().flat_map(|s| s.to_le_bytes()).collect();
-                stdin.write_all(&bytes).is_err()
+                // Write in small slices: `write_all` blocks while the player's pipe is full, and a
+                // whole sentence is seconds of audio. Checking the epoch between slices lets a
+                // `stop` take effect within ~40 ms instead of after the chunk has drained.
+                let mut failed = false;
+                for piece in bytes.chunks(4096) {
+                    if epoch != state.epoch.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if stdin.write_all(piece).is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                failed
             }
         };
         if restart {
