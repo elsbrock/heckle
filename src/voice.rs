@@ -2,10 +2,11 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc;
+use std::process::{ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use sherpa_onnx::{
@@ -13,12 +14,17 @@ use sherpa_onnx::{
     OfflineTtsModelConfig,
 };
 
+/// Playback bookkeeping shared between the synthesis worker and the caller.
+struct State {
+    /// When the audio queued so far will finish playing.
+    busy_until: Mutex<Instant>,
+    /// Clauses handed to `say` that have not finished synthesizing.
+    pending: AtomicUsize,
+}
+
 pub struct Voice {
-    tts: OfflineTts,
-    sid: i32,
-    speed: f32,
-    audio: mpsc::Sender<Vec<f32>>,
-    _player: Child,
+    tx: mpsc::Sender<String>,
+    state: Arc<State>,
 }
 
 impl Voice {
@@ -58,54 +64,79 @@ impl Voice {
             .spawn()
             .context("spawning pw-cat")?;
         let stdin = player.stdin.take().context("pw-cat stdin")?;
-        let (audio, rx) = mpsc::channel::<Vec<f32>>();
-        thread::spawn(move || pump(rx, stdin));
+        let (audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>();
+        thread::spawn(move || pump(audio_rx, stdin));
 
-        Ok(Self {
-            tts,
-            sid,
-            speed,
-            audio,
-            _player: player,
-        })
+        let state = Arc::new(State {
+            busy_until: Mutex::new(Instant::now()),
+            pending: AtomicUsize::new(0),
+        });
+        let (tx, rx) = mpsc::channel::<String>();
+        let worker_state = state.clone();
+        thread::spawn(move || {
+            let _player = player; // keep the player alive for the worker's lifetime
+            let gen_config = GenerationConfig {
+                sid,
+                speed,
+                ..Default::default()
+            };
+            for text in rx {
+                synthesize(&tts, &gen_config, &text, rate, &audio_tx, &worker_state);
+                worker_state.pending.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
+
+        Ok(Self { tx, state })
     }
 
-    /// Synthesize `text`; each finished sentence chunk is queued for playback immediately.
-    /// Blocks until synthesis (not playback) is done.
-    pub fn speak(&self, text: &str) -> Result<()> {
-        let start = Instant::now();
-        let tx = self.audio.clone();
-        let mut first = true;
-        let config = GenerationConfig {
-            sid: self.sid,
-            speed: self.speed,
-            ..Default::default()
-        };
-        let audio = self
-            .tts
-            .generate_with_config(
-                text,
-                &config,
-                Some(move |chunk: &[f32], _progress: f32| {
-                    if first {
-                        tracing::info!(
-                            ms = start.elapsed().as_millis() as u64,
-                            samples = chunk.len(),
-                            "first audio chunk"
-                        );
-                        first = false;
-                    }
-                    tx.send(chunk.to_vec()).is_ok()
-                }),
-            )
-            .context("tts generation failed")?;
-        tracing::info!(
-            ms = start.elapsed().as_millis() as u64,
-            samples = audio.samples().len(),
-            secs = audio.samples().len() as f32 / audio.sample_rate() as f32,
-            "synthesis done"
-        );
-        Ok(())
+    /// Queue a clause for synthesis and playback; returns immediately.
+    pub fn say(&self, text: String) {
+        self.state.pending.fetch_add(1, Ordering::SeqCst);
+        if self.tx.send(text).is_err() {
+            self.state.pending.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// True once everything queued is synthesized and at most `lookahead` of audio remains.
+    pub fn ready_within(&self, lookahead: Duration) -> bool {
+        self.state.pending.load(Ordering::SeqCst) == 0
+            && self
+                .state
+                .busy_until
+                .lock()
+                .unwrap()
+                .saturating_duration_since(Instant::now())
+                <= lookahead
+    }
+}
+
+fn synthesize(
+    tts: &OfflineTts,
+    config: &GenerationConfig,
+    text: &str,
+    rate: i32,
+    audio_tx: &mpsc::Sender<Vec<f32>>,
+    state: &Arc<State>,
+) {
+    let start = Instant::now();
+    let (tx, st) = (audio_tx.clone(), state.clone());
+    let mut first = true;
+    let audio = tts.generate_with_config(
+        text,
+        config,
+        Some(move |chunk: &[f32], _progress: f32| {
+            if first {
+                tracing::info!(ms = start.elapsed().as_millis() as u64, "first audio chunk");
+                first = false;
+            }
+            let mut busy = st.busy_until.lock().unwrap();
+            *busy = (*busy).max(Instant::now())
+                + Duration::from_secs_f32(chunk.len() as f32 / rate as f32);
+            tx.send(chunk.to_vec()).is_ok()
+        }),
+    );
+    if audio.is_none() {
+        tracing::warn!(text, "tts generation failed");
     }
 }
 

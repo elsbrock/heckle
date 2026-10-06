@@ -3,7 +3,7 @@ mod screen;
 mod voice;
 
 use std::io::Cursor;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -11,8 +11,10 @@ use image::{ImageFormat, imageops::FilterType};
 
 const SYSTEM: &str = "You are Sir David Attenborough narrating a nature documentary. The subject is a human \
 at its workstation (the screen). Observe behaviour and what is on screen with hushed wonder and dry British wit. \
-Speak in ONE short sentence, present tense, as spoken narration: no markdown, no emoji. \
-Never read out passwords, tokens or private message contents.";
+Speak in ONE sentence of at most 15 words, present tense, as spoken narration: no markdown, no emoji. \
+Be specific to what you see and never repeat your earlier lines. \
+Never read out passwords, tokens or private message contents. \
+If nothing has meaningfully changed, reply exactly: SILENCE";
 
 #[derive(Parser)]
 struct Args {
@@ -23,9 +25,12 @@ struct Args {
     /// Longest edge of the screen frame sent to the model.
     #[arg(long, default_value_t = 768)]
     width: u32,
-    /// Send N requests on one HTTP client (one capture each) to measure warm-connection latency.
-    #[arg(long, default_value_t = 1)]
+    /// Stop after N narrations (0 = run until interrupted).
+    #[arg(long, default_value_t = 0)]
     repeat: u32,
+    /// Start the next look when this much audio is left, to hide the model's latency.
+    #[arg(long, default_value_t = 1500)]
+    lookahead_ms: u64,
     /// Speak this text with the local voice and exit (voice spike).
     #[arg(long)]
     say: Option<String>,
@@ -63,14 +68,15 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
-    if let Some(text) = &args.say {
-        let dir = args.voice_dir.replacen('~', &std::env::var("HOME")?, 1);
-        let t = Instant::now();
-        let voice = voice::Voice::new(std::path::Path::new(&dir), args.sid, args.speed)?;
-        tracing::info!(ms = t.elapsed().as_millis() as u64, "voice loaded");
-        voice.speak(text)?;
-        // Give the player time to drain before exiting (spike only).
-        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+    let dir = args.voice_dir.replacen('~', &std::env::var("HOME")?, 1);
+    let t = Instant::now();
+    let voice = voice::Voice::new(std::path::Path::new(&dir), args.sid, args.speed)?;
+    tracing::info!(ms = t.elapsed().as_millis() as u64, "voice loaded");
+
+    if let Some(text) = args.say {
+        voice.say(text);
+        wait_ready(&voice, Duration::ZERO).await;
+        tokio::time::sleep(Duration::from_millis(400)).await; // player buffer
         return Ok(());
     }
 
@@ -78,25 +84,49 @@ async fn main() -> Result<()> {
         args.api_key.context("OPENROUTER_API_KEY is required")?,
         args.model,
     );
-    for i in 0..args.repeat {
-        tracing::info!(run = i + 1, "---");
+    let lookahead = Duration::from_millis(args.lookahead_ms);
+    let mut history: Vec<String> = Vec::new();
+    let mut n = 0;
+    while args.repeat == 0 || n < args.repeat {
+        wait_ready(&voice, lookahead).await;
         let t = Instant::now();
         let frame = screen::capture().context("screen capture")?;
-        tracing::info!(
-            ms = t.elapsed().as_millis() as u64,
-            w = frame.width(),
-            h = frame.height(),
-            "captured"
-        );
         let jpeg = to_jpeg(&frame, args.width)?;
-        tracing::info!(
-            ms = t.elapsed().as_millis() as u64,
-            bytes = jpeg.len(),
-            "encoded"
-        );
-        brain
-            .narrate(SYSTEM, &[], &[jpeg], |s| println!("{s}"))
-            .await?;
+        tracing::info!(ms = t.elapsed().as_millis() as u64, "captured+encoded");
+
+        let recent = &history[history.len().saturating_sub(6)..];
+        let (mut line, mut silent) = (String::new(), false);
+        let res = brain
+            .narrate(SYSTEM, recent, &[jpeg], |chunk| {
+                if silent || chunk.starts_with("SILENCE") {
+                    silent = true;
+                    return;
+                }
+                println!("{chunk}");
+                line.push_str(&chunk);
+                line.push(' ');
+                voice.say(chunk);
+            })
+            .await;
+        if let Err(e) = res {
+            tracing::warn!("narration failed: {e:#}");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            continue;
+        }
+        if silent {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            continue;
+        }
+        history.push(line.trim().to_string());
+        n += 1;
     }
+    wait_ready(&voice, Duration::ZERO).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
     Ok(())
+}
+
+async fn wait_ready(voice: &voice::Voice, lookahead: Duration) {
+    while !voice.ready_within(lookahead) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

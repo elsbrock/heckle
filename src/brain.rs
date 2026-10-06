@@ -22,13 +22,13 @@ impl Brain {
         }
     }
 
-    /// Stream a narration for the given JPEG frames; `on_sentence` fires per completed sentence.
+    /// Stream a narration for the given JPEG frames; `on_chunk` fires per completed sentence.
     pub async fn narrate(
         &self,
         system: &str,
         history: &[String],
         jpegs: &[Vec<u8>],
-        mut on_sentence: impl FnMut(String),
+        mut on_chunk: impl FnMut(String),
     ) -> Result<()> {
         let start = Instant::now();
         let mut content: Vec<Value> = jpegs
@@ -89,25 +89,31 @@ impl Brain {
                     first_token = false;
                 }
                 pending.push_str(delta);
-                while let Some(end) = sentence_end(&pending) {
+                while let Some(end) = chunk_end(&pending) {
                     let s: String = pending.drain(..end).collect();
-                    on_sentence(s.trim().to_string());
+                    on_chunk(s.trim().to_string());
                 }
             }
         }
         if !pending.trim().is_empty() {
-            on_sentence(pending.trim().to_string());
+            on_chunk(pending.trim().to_string());
         }
         tracing::info!(ms = start.elapsed().as_millis() as u64, "stream done");
         Ok(())
     }
 }
 
-/// Byte index just past the first sentence terminator followed by whitespace.
-fn sentence_end(s: &str) -> Option<usize> {
+/// Byte index just past the first sentence end, or past a clause break (`, ; : —`) once at least
+/// `MIN_CLAUSE` bytes are buffered, so speech can start before the sentence is finished.
+fn chunk_end(s: &str) -> Option<usize> {
+    const MIN_CLAUSE: usize = 25;
     let mut it = s.char_indices().peekable();
     while let Some((i, c)) = it.next() {
-        if matches!(c, '.' | '!' | '?') && it.peek().is_some_and(|&(_, n)| n.is_whitespace()) {
+        let spaced = it.peek().is_some_and(|&(_, n)| n.is_whitespace());
+        if spaced
+            && (matches!(c, '.' | '!' | '?')
+                || (i >= MIN_CLAUSE && matches!(c, ',' | ';' | ':' | '—')))
+        {
             return Some(i + c.len_utf8());
         }
     }
@@ -116,12 +122,19 @@ fn sentence_end(s: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::sentence_end;
+    use super::chunk_end;
 
     #[test]
-    fn splits_on_terminator_plus_space() {
-        assert_eq!(sentence_end("Hello there. More"), Some(12));
-        assert_eq!(sentence_end("No end yet"), None);
-        assert_eq!(sentence_end("Ends at tail."), None); // wait for whitespace or flush
+    fn splits_on_sentence_end() {
+        assert_eq!(chunk_end("Hello there. More"), Some(12));
+        assert_eq!(chunk_end("No end yet"), None);
+        assert_eq!(chunk_end("Ends at tail."), None); // wait for whitespace or flush
+    }
+
+    #[test]
+    fn splits_on_clause_only_when_long_enough() {
+        assert_eq!(chunk_end("Well, hmm"), None);
+        let s = "The specimen hunches closer to the terminal, squinting";
+        assert_eq!(chunk_end(s), Some(44));
     }
 }
