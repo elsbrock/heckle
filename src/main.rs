@@ -1,5 +1,6 @@
 mod brain;
 mod screen;
+mod voice;
 
 use std::io::Cursor;
 use std::time::Instant;
@@ -16,7 +17,7 @@ Never read out passwords, tokens or private message contents.";
 #[derive(Parser)]
 struct Args {
     #[arg(long, env = "OPENROUTER_API_KEY", hide_env_values = true)]
-    api_key: String,
+    api_key: Option<String>,
     #[arg(long, default_value = "anthropic/claude-haiku-4.5")]
     model: String,
     /// Longest edge of the screen frame sent to the model.
@@ -25,6 +26,17 @@ struct Args {
     /// Send N requests on one HTTP client (one capture each) to measure warm-connection latency.
     #[arg(long, default_value_t = 1)]
     repeat: u32,
+    /// Speak this text with the local voice and exit (voice spike).
+    #[arg(long)]
+    say: Option<String>,
+    /// Kokoro model directory.
+    #[arg(long, default_value = "~/.cache/narrator/models/kokoro-en-v0_19")]
+    voice_dir: String,
+    /// Kokoro speaker id (9 = bm_george, 10 = bm_lewis, 5 = am_adam).
+    #[arg(long, default_value_t = 9)]
+    sid: i32,
+    #[arg(long, default_value_t = 1.0)]
+    speed: f32,
 }
 
 fn to_jpeg(img: &image::RgbImage, edge: u32) -> Result<Vec<u8>> {
@@ -51,7 +63,21 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
-    let brain = brain::Brain::new(args.api_key, args.model);
+    if let Some(text) = &args.say {
+        let dir = args.voice_dir.replacen('~', &std::env::var("HOME")?, 1);
+        let t = Instant::now();
+        let voice = voice::Voice::new(std::path::Path::new(&dir), args.sid, args.speed)?;
+        tracing::info!(ms = t.elapsed().as_millis() as u64, "voice loaded");
+        voice.speak(text)?;
+        // Give the player time to drain before exiting (spike only).
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        return Ok(());
+    }
+
+    let brain = brain::Brain::new(
+        args.api_key.context("OPENROUTER_API_KEY is required")?,
+        args.model,
+    );
     for i in 0..args.repeat {
         tracing::info!(run = i + 1, "---");
         let t = Instant::now();
