@@ -85,8 +85,8 @@ struct Args {
     /// Disable the webcam (screen only).
     #[arg(long)]
     no_camera: bool,
-    /// PipeWire node name or serial of the camera (default: the default video source).
-    #[arg(long)]
+    /// Camera to use: part of its name (e.g. "insta"); default is PipeWire's default source.
+    #[arg(long, env = "NARRATOR_CAMERA")]
     camera_target: Option<String>,
     /// Start the next look when this much audio is left, to hide the model's latency.
     #[arg(long, default_value_t = 1500)]
@@ -116,6 +116,12 @@ fn to_jpeg(img: &image::RgbImage, edge: u32) -> Result<Vec<u8>> {
     let mut out = Cursor::new(Vec::new());
     small.write_to(&mut out, ImageFormat::Jpeg)?;
     Ok(out.into_inner())
+}
+
+/// Decode a JPEG and re-encode it with its longest edge at `edge`.
+fn shrink(jpeg: &[u8], edge: u32) -> Result<Vec<u8>> {
+    let img = image::load_from_memory_with_format(jpeg, ImageFormat::Jpeg)?.to_rgb8();
+    to_jpeg(&img, edge)
 }
 
 #[tokio::main]
@@ -158,12 +164,26 @@ async fn start_camera(args: &Args) -> Option<camera::Camera> {
     if args.no_camera {
         return None;
     }
-    match camera::Camera::start(args.camera_target.as_deref(), 2) {
-        Ok(c) => {
-            if !c.wait_ready(Duration::from_secs(5)).await {
-                tracing::warn!("no webcam frame within 5s, will keep trying");
+    let (target, label, mode) = match args.camera_target.as_deref() {
+        Some(q) => match camera::resolve(q).await {
+            Ok(f) => (Some(f.name), f.description, f.mode),
+            Err(e) => {
+                tracing::warn!("camera unavailable, continuing screen-only: {e:#}");
+                return None;
             }
+        },
+        None => (None, "default camera".to_string(), camera::Mode::Raw),
+    };
+    let t = Instant::now();
+    match camera::Camera::start(target.as_deref(), 2, mode) {
+        // Some USB cameras take several seconds to wake up and deliver a first frame.
+        Ok(c) if c.wait_ready(Duration::from_secs(15)).await => {
+            tracing::info!(camera = %label, ?mode, ms = t.elapsed().as_millis() as u64, "camera ready");
             Some(c)
+        }
+        Ok(_) => {
+            tracing::warn!(camera = %label, ?mode, "no frames, continuing screen-only");
+            None
         }
         Err(e) => {
             tracing::warn!("camera unavailable, continuing screen-only: {e:#}");
@@ -329,7 +349,7 @@ async fn narrate(
     let mut images = vec![("Screen", to_jpeg(&frame, ctx.width)?)];
     if let Some(cam) = camera {
         match cam.latest(Duration::from_secs(3)) {
-            Some(jpeg) => images.push(("Webcam", jpeg)),
+            Some(jpeg) => images.push(("Webcam", shrink(&jpeg, 640)?)),
             None => tracing::warn!("no fresh webcam frame, sending screen only"),
         }
     }
@@ -358,5 +378,18 @@ async fn narrate(
 async fn wait_ready(voice: &voice::Voice, lookahead: Duration) {
     while !voice.ready_within(lookahead) {
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shrink_keeps_aspect_ratio() {
+        let src = to_jpeg(&image::RgbImage::new(1920, 1080), 1920).unwrap();
+        let out = shrink(&src, 640).unwrap();
+        let img = image::load_from_memory(&out).unwrap();
+        assert_eq!((img.width(), img.height()), (640, 360));
     }
 }
