@@ -10,7 +10,11 @@
     in {
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer pkg-config ];
+          packages = with pkgs; [
+            cargo rustc clippy rustfmt rust-analyzer pkg-config
+            # webcam: gst-launch + the pipewiresrc plugin
+            gst_all_1.gstreamer gst_all_1.gst-plugins-base gst_all_1.gst-plugins-good pipewire
+          ];
           RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         };
       });

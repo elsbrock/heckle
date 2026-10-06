@@ -1,4 +1,5 @@
 mod brain;
+mod camera;
 mod screen;
 mod voice;
 
@@ -10,7 +11,8 @@ use clap::Parser;
 use image::{ImageFormat, imageops::FilterType};
 
 const SYSTEM: &str = "You are Sir David Attenborough narrating a nature documentary. The subject is a human \
-at its workstation (the screen). Observe behaviour and what is on screen with hushed wonder and dry British wit. \
+at its workstation. You get the screen and, when available, a webcam image of the human. \
+Observe their behaviour, mood and what is on screen with hushed wonder and dry British wit. \
 Speak in ONE sentence of at most 15 words, present tense, as spoken narration: no markdown, no emoji. \
 Be specific to what you see and never repeat your earlier lines. \
 Never read out passwords, tokens or private message contents. \
@@ -28,6 +30,12 @@ struct Args {
     /// Stop after N narrations (0 = run until interrupted).
     #[arg(long, default_value_t = 0)]
     repeat: u32,
+    /// Disable the webcam (screen only).
+    #[arg(long)]
+    no_camera: bool,
+    /// PipeWire node name or serial of the camera (default: the default video source).
+    #[arg(long)]
+    camera_target: Option<String>,
     /// Start the next look when this much audio is left, to hide the model's latency.
     #[arg(long, default_value_t = 1500)]
     lookahead_ms: u64,
@@ -84,6 +92,22 @@ async fn main() -> Result<()> {
         args.api_key.context("OPENROUTER_API_KEY is required")?,
         args.model,
     );
+    let camera = if args.no_camera {
+        None
+    } else {
+        match camera::Camera::start(args.camera_target.as_deref(), 2) {
+            Ok(c) => {
+                if !c.wait_ready(Duration::from_secs(5)).await {
+                    tracing::warn!("no webcam frame within 5s, will keep trying");
+                }
+                Some(c)
+            }
+            Err(e) => {
+                tracing::warn!("camera unavailable, continuing screen-only: {e:#}");
+                None
+            }
+        }
+    };
     let lookahead = Duration::from_millis(args.lookahead_ms);
     let mut history: Vec<String> = Vec::new();
     let mut n = 0;
@@ -91,13 +115,23 @@ async fn main() -> Result<()> {
         wait_ready(&voice, lookahead).await;
         let t = Instant::now();
         let frame = screen::capture().context("screen capture")?;
-        let jpeg = to_jpeg(&frame, args.width)?;
-        tracing::info!(ms = t.elapsed().as_millis() as u64, "captured+encoded");
+        let mut images = vec![("Screen", to_jpeg(&frame, args.width)?)];
+        if let Some(cam) = &camera {
+            match cam.latest(Duration::from_secs(3)) {
+                Some(jpeg) => images.push(("Webcam", jpeg)),
+                None => tracing::warn!("no fresh webcam frame, sending screen only"),
+            }
+        }
+        tracing::info!(
+            ms = t.elapsed().as_millis() as u64,
+            images = images.len(),
+            "captured+encoded"
+        );
 
         let recent = &history[history.len().saturating_sub(6)..];
         let (mut line, mut silent) = (String::new(), false);
         let res = brain
-            .narrate(SYSTEM, recent, &[jpeg], |chunk| {
+            .narrate(SYSTEM, recent, &images, |chunk| {
                 if silent || chunk.starts_with("SILENCE") {
                     silent = true;
                     return;

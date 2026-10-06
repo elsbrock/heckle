@@ -27,13 +27,18 @@ impl Brain {
         &self,
         system: &str,
         history: &[String],
-        jpegs: &[Vec<u8>],
+        images: &[(&str, Vec<u8>)],
         mut on_chunk: impl FnMut(String),
     ) -> Result<()> {
         let start = Instant::now();
-        let mut content: Vec<Value> = jpegs
+        let mut content: Vec<Value> = images
             .iter()
-            .map(|j| json!({"type": "image_url", "image_url": {"url": format!("data:image/jpeg;base64,{}", STANDARD.encode(j))}}))
+            .flat_map(|(label, jpeg)| {
+                [
+                    json!({"type": "text", "text": format!("{label}:")}),
+                    json!({"type": "image_url", "image_url": {"url": format!("data:image/jpeg;base64,{}", STANDARD.encode(jpeg))}}),
+                ]
+            })
             .collect();
         content.push(json!({"type": "text", "text": format!(
             "Your previous lines (do not repeat):\n{}\nNarrate now.", history.join("\n"))}));
