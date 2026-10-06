@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch};
 
@@ -111,6 +111,11 @@ pub async fn send(line: &str) -> Result<String> {
 
 /// Bind the control socket and forward parsed commands to `tx`.
 pub async fn serve(tx: mpsc::UnboundedSender<Cmd>, status: watch::Receiver<Status>) -> Result<()> {
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        bail!(
+            "XDG_RUNTIME_DIR is not set; refusing to put the control socket in a shared directory"
+        );
+    }
     let path = socket_path();
     if path.exists() {
         if UnixStream::connect(&path).await.is_ok() {
@@ -123,16 +128,26 @@ pub async fn serve(tx: mpsc::UnboundedSender<Cmd>, status: watch::Receiver<Statu
     }
     let listener =
         UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
+    // Only the owner may control the daemon (it triggers screen and webcam captures).
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .context("restricting socket permissions")?;
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
+                // e.g. out of file descriptors: don't spin
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             };
             let (tx, status) = (tx.clone(), status.clone());
             tokio::spawn(async move {
                 let (read, mut write) = stream.into_split();
                 let mut line = String::new();
-                if BufReader::new(read).read_line(&mut line).await.is_err() {
+                // commands are short; cap the line so a runaway client cannot grow memory
+                if BufReader::new(read.take(4096))
+                    .read_line(&mut line)
+                    .await
+                    .is_err()
+                {
                     return;
                 }
                 let line = line.trim();
