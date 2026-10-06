@@ -50,6 +50,16 @@ impl ksni::Tray for Tray {
                 ..Default::default()
             }
             .into(),
+            CheckmarkItem {
+                label: "Camera preview".into(),
+                checked: self.status.preview,
+                enabled: self.status.enabled,
+                activate: Box::new(|t: &mut Self| {
+                    let _ = t.tx.send(Cmd::Preview(Set::Toggle));
+                }),
+                ..Default::default()
+            }
+            .into(),
             ksni::MenuItem::Separator,
             StandardItem {
                 label: "Narrate now".into(),

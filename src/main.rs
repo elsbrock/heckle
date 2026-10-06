@@ -61,6 +61,10 @@ enum Sub {
     Auto {
         set: SetArg,
     },
+    /// Show or hide a window with the live webcam.
+    Preview {
+        set: SetArg,
+    },
     /// Turn the whole daemon on or off (off also stops the camera).
     Enable,
     Disable,
@@ -86,6 +90,9 @@ struct Args {
     /// Start in continuous mode (default: idle until `narrator poke`).
     #[arg(long)]
     auto: bool,
+    /// Open the webcam preview window at startup.
+    #[arg(long)]
+    preview: bool,
     /// Disable the webcam (screen only).
     #[arg(long)]
     no_camera: bool,
@@ -189,6 +196,7 @@ async fn main() -> Result<()> {
         }
         Some(Sub::Stop) => ipc::Cmd::Stop.wire(),
         Some(Sub::Auto { set }) => ipc::Cmd::Auto(set.into()).wire(),
+        Some(Sub::Preview { set }) => ipc::Cmd::Preview(set.into()).wire(),
         Some(Sub::Enable) => ipc::Cmd::Enabled(ipc::Set::On).wire(),
         Some(Sub::Disable) => ipc::Cmd::Enabled(ipc::Set::Off).wire(),
         Some(Sub::Toggle) => ipc::Cmd::Enabled(ipc::Set::Toggle).wire(),
@@ -210,20 +218,52 @@ struct Ctx {
     tiles: u32,
 }
 
-async fn start_camera(args: &Args) -> Option<camera::Camera> {
+/// Which camera to use: `(PipeWire node name, description, how to read it)`.
+async fn pick_camera(args: &Args) -> Option<(Option<String>, String, camera::Mode)> {
     if args.no_camera {
         return None;
     }
-    let (target, label, mode) = match args.camera_target.as_deref() {
+    match args.camera_target.as_deref() {
         Some(q) => match camera::resolve(q).await {
-            Ok(f) => (Some(f.name), f.description, f.mode),
+            Ok(f) => Some((Some(f.name), f.description, f.mode)),
             Err(e) => {
-                tracing::warn!("camera unavailable, continuing screen-only: {e:#}");
-                return None;
+                tracing::warn!("camera unavailable: {e:#}");
+                None
             }
         },
-        None => (None, "default camera".to_string(), camera::Mode::Raw),
+        None => Some((None, "default camera".to_string(), camera::Mode::Raw)),
+    }
+}
+
+/// Open, close or toggle the preview window, keeping `status.preview` truthful.
+async fn set_preview(
+    args: &Args,
+    preview: &mut Option<camera::Preview>,
+    status: &mut ipc::Status,
+    set: ipc::Set,
+) {
+    let want = set.apply(status.preview);
+    *preview = None; // closes any existing window
+    status.preview = false;
+    if !want || !status.enabled {
+        return;
+    }
+    let Some((target, label, mode)) = pick_camera(args).await else {
+        tracing::warn!("preview unavailable: no usable camera");
+        return;
     };
+    match camera::Preview::start(target.as_deref(), mode) {
+        Ok(p) => {
+            tracing::info!(camera = %label, "preview opened");
+            *preview = Some(p);
+            status.preview = true;
+        }
+        Err(e) => tracing::warn!("preview unavailable: {e:#}"),
+    }
+}
+
+async fn start_camera(args: &Args) -> Option<camera::Camera> {
+    let (target, label, mode) = pick_camera(args).await?;
     let t = Instant::now();
     match camera::Camera::start(target.as_deref(), 2, mode) {
         // Some USB cameras take several seconds to wake up and deliver a first frame.
@@ -282,6 +322,7 @@ async fn run(args: Args) -> Result<()> {
     let mut status = ipc::Status {
         enabled: true,
         auto: args.auto,
+        preview: false,
     };
     let (status_tx, status_rx) = watch::channel(status);
     ipc::serve(tx.clone(), status_rx).await?;
@@ -298,6 +339,11 @@ async fn run(args: Args) -> Result<()> {
     });
 
     let mut camera = start_camera(&args).await;
+    let mut preview: Option<camera::Preview> = None;
+    if args.preview {
+        set_preview(&args, &mut preview, &mut status, ipc::Set::On).await;
+        publish(&status_tx, &tray, status).await;
+    }
     let lookahead = Duration::from_millis(args.lookahead_ms);
     let mut history: Vec<String> = Vec::new();
     let mut queued: Option<ipc::Cmd> = None;
@@ -305,6 +351,11 @@ async fn run(args: Args) -> Result<()> {
     tracing::info!(socket = %ipc::socket_path().display(), auto = status.auto, "ready");
 
     loop {
+        if preview.as_mut().is_some_and(|p| !p.is_running()) {
+            preview = None; // the window was closed
+            status.preview = false;
+            publish(&status_tx, &tray, status).await;
+        }
         let cmd = match queued.take() {
             Some(c) => Some(c),
             None => tokio::select! {
@@ -323,9 +374,16 @@ async fn run(args: Args) -> Result<()> {
                 publish(&status_tx, &tray, status).await;
                 continue;
             }
+            Some(ipc::Cmd::Preview(set)) => {
+                set_preview(&args, &mut preview, &mut status, set).await;
+                publish(&status_tx, &tray, status).await;
+                continue;
+            }
             Some(ipc::Cmd::Enabled(set)) => {
                 status.enabled = set.apply(status.enabled);
                 ctx.voice.stop();
+                preview = None; // disabling also closes the preview
+                status.preview = false;
                 camera = None; // stops the pipeline (and the LED) right away
                 publish(&status_tx, &tray, status).await;
                 if status.enabled {
@@ -368,9 +426,16 @@ async fn run(args: Args) -> Result<()> {
                             queued = Some(c);
                             break None; // drops the request in flight
                         }
-                        if let ipc::Cmd::Auto(set) = c {
-                            status.auto = set.apply(status.auto);
-                            publish(&status_tx, &tray, status).await;
+                        match c {
+                            ipc::Cmd::Auto(set) => {
+                                status.auto = set.apply(status.auto);
+                                publish(&status_tx, &tray, status).await;
+                            }
+                            ipc::Cmd::Preview(set) => {
+                                set_preview(&args, &mut preview, &mut status, set).await;
+                                publish(&status_tx, &tray, status).await;
+                            }
+                            _ => {}
                         }
                     }
                 }

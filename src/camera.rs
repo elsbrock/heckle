@@ -78,21 +78,56 @@ pub async fn resolve(query: &str) -> Result<Found> {
     })
 }
 
+/// The GStreamer source chain for a camera: PipeWire source plus a decoder when it only
+/// offers MJPEG.
+fn source_chain(target: Option<&str>, mode: Mode) -> String {
+    let src = match target {
+        Some(t) => format!("pipewiresrc target-object={t}"),
+        None => "pipewiresrc".to_string(),
+    };
+    match mode {
+        Mode::Raw => src,
+        Mode::Mjpeg => format!("{src} ! image/jpeg ! jpegdec"),
+    }
+}
+
+/// A window showing the live camera. It is a second reader of the shared PipeWire camera, so
+/// it does not interfere with the narrator's own pipeline.
+pub struct Preview {
+    child: Child,
+}
+
+impl Preview {
+    pub fn start(target: Option<&str>, mode: Mode) -> Result<Self> {
+        // No scaler: waylandsink lets the compositor scale the video to the window.
+        let pipeline = format!(
+            "{} ! videoconvert ! waylandsink",
+            source_chain(target, mode)
+        );
+        tracing::debug!(%pipeline, "starting preview pipeline");
+        let child = Command::new("gst-launch-1.0")
+            .arg("-q")
+            .args(pipeline.split_whitespace())
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawning gst-launch-1.0 (is gstreamer on PATH?)")?;
+        Ok(Self { child })
+    }
+
+    /// False once the window has been closed or the pipeline died.
+    pub fn is_running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
 impl Camera {
     /// Start the pipeline. `target` is an optional PipeWire node name or serial.
     pub fn start(target: Option<&str>, fps: u32, mode: Mode) -> Result<Self> {
-        let src = match target {
-            Some(t) => format!("pipewiresrc target-object={t}"),
-            None => "pipewiresrc".to_string(),
-        };
         // Frames are only decoded, thinned and re-encoded here; scaling is done by the consumer
         // (scaling in the pipeline distorts the aspect ratio when only a width is pinned).
-        let decode = match mode {
-            Mode::Raw => "",
-            Mode::Mjpeg => "! image/jpeg ! jpegdec",
-        };
+        let src = source_chain(target, mode);
         let pipeline = format!(
-            "{src} {decode} ! videorate drop-only=true max-rate={fps} \
+            "{src} ! videorate drop-only=true max-rate={fps} \
              ! videoconvert ! jpegenc quality=70 ! fdsink fd=1"
         );
         tracing::debug!(%pipeline, "starting camera pipeline");

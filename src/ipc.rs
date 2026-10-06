@@ -49,6 +49,8 @@ pub enum Cmd {
     Stop,
     /// Continuous narration on/off.
     Auto(Set),
+    /// Show or hide the webcam preview window.
+    Preview(Set),
     /// Whole daemon on/off; off also shuts the camera down.
     Enabled(Set),
     Quit,
@@ -57,7 +59,7 @@ pub enum Cmd {
 impl Cmd {
     /// Whether this command should abort a narration that is in flight.
     pub fn cancels_narration(&self) -> bool {
-        !matches!(self, Cmd::Auto(_))
+        !matches!(self, Cmd::Auto(_) | Cmd::Preview(_))
     }
 
     pub fn wire(&self) -> String {
@@ -66,6 +68,7 @@ impl Cmd {
             Cmd::Poke(Some(h)) => format!("poke {h}"),
             Cmd::Stop => "stop".into(),
             Cmd::Auto(s) => format!("auto {}", s.wire()),
+            Cmd::Preview(s) => format!("preview {}", s.wire()),
             Cmd::Enabled(s) => format!("enabled {}", s.wire()),
             Cmd::Quit => "quit".into(),
         }
@@ -78,6 +81,7 @@ impl Cmd {
             "poke" => Cmd::Poke((!rest.is_empty()).then(|| rest.to_string())),
             "stop" => Cmd::Stop,
             "auto" => Cmd::Auto(Set::parse(rest)?),
+            "preview" => Cmd::Preview(Set::parse(rest)?),
             "enabled" => Cmd::Enabled(Set::parse(rest)?),
             "quit" => Cmd::Quit,
             other => bail!("unknown command {other:?}"),
@@ -89,6 +93,7 @@ impl Cmd {
 pub struct Status {
     pub enabled: bool,
     pub auto: bool,
+    pub preview: bool,
 }
 
 pub fn socket_path() -> PathBuf {
@@ -153,7 +158,10 @@ pub async fn serve(tx: mpsc::UnboundedSender<Cmd>, status: watch::Receiver<Statu
                 let line = line.trim();
                 let reply = if line == "status" {
                     let s = *status.borrow();
-                    format!("enabled={} auto={}", s.enabled, s.auto)
+                    format!(
+                        "enabled={} auto={} preview={}",
+                        s.enabled, s.auto, s.preview
+                    )
                 } else {
                     match Cmd::parse(line) {
                         Ok(cmd) => {
@@ -181,6 +189,7 @@ mod tests {
             "poke what is he doing",
             "stop",
             "auto toggle",
+            "preview on",
             "enabled off",
             "quit",
         ] {
