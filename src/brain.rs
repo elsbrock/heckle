@@ -32,7 +32,7 @@ impl Brain {
         &self,
         system: &str,
         history: &[String],
-        images: &[(&str, Vec<u8>)],
+        images: &[(String, Vec<u8>)],
         instruction: &str,
         mut on_chunk: impl FnMut(String),
     ) -> Result<()> {

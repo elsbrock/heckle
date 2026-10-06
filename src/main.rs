@@ -76,9 +76,13 @@ struct Args {
     api_key: Option<String>,
     #[arg(long, default_value = "anthropic/claude-haiku-4.5")]
     model: String,
-    /// Longest edge of the screen frame sent to the model.
-    #[arg(long, default_value_t = 768)]
+    /// Longest edge of each screen tile sent to the model (Claude downsizes beyond ~1568).
+    #[arg(long, default_value_t = 1568)]
     width: u32,
+    /// Split the screen into this many vertical tiles so text stays readable on wide displays
+    /// (0 = automatic, one tile per ~2560 px of width).
+    #[arg(long, default_value_t = 0)]
+    tiles: u32,
     /// Start in continuous mode (default: idle until `narrator poke`).
     #[arg(long)]
     auto: bool,
@@ -106,15 +110,19 @@ struct Args {
 
 fn to_jpeg(img: &image::RgbImage, edge: u32) -> Result<Vec<u8>> {
     let (w, h) = img.dimensions();
-    let scale = edge as f32 / w.max(h) as f32;
-    let small = image::imageops::resize(
-        img,
-        (w as f32 * scale) as u32,
-        (h as f32 * scale) as u32,
-        FilterType::Triangle,
-    );
+    let scale = (edge as f32 / w.max(h) as f32).min(1.0);
     let mut out = Cursor::new(Vec::new());
-    small.write_to(&mut out, ImageFormat::Jpeg)?;
+    if scale < 1.0 {
+        image::imageops::resize(
+            img,
+            (w as f32 * scale) as u32,
+            (h as f32 * scale) as u32,
+            FilterType::Triangle,
+        )
+        .write_to(&mut out, ImageFormat::Jpeg)?;
+    } else {
+        img.write_to(&mut out, ImageFormat::Jpeg)?;
+    }
     Ok(out.into_inner())
 }
 
@@ -122,6 +130,47 @@ fn to_jpeg(img: &image::RgbImage, edge: u32) -> Result<Vec<u8>> {
 fn shrink(jpeg: &[u8], edge: u32) -> Result<Vec<u8>> {
     let img = image::load_from_memory_with_format(jpeg, ImageFormat::Jpeg)?.to_rgb8();
     to_jpeg(&img, edge)
+}
+
+/// Widest tile (in physical pixels) before the frame is split: wider tiles would be downscaled
+/// below ~0.6x when sent, which makes small text unreadable.
+const MAX_TILE_WIDTH: u32 = 2560;
+
+/// Cut the frame into vertical tiles (left to right) and encode each, in parallel.
+fn screen_tiles(img: &image::RgbImage, edge: u32, count: u32) -> Result<Vec<(String, Vec<u8>)>> {
+    let (w, h) = img.dimensions();
+    let n = if count == 0 {
+        w.div_ceil(MAX_TILE_WIDTH).max(1)
+    } else {
+        count
+    };
+    let jpegs = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                s.spawn(move || {
+                    let (x0, x1) = (w * i / n, w * (i + 1) / n);
+                    let tile = image::imageops::crop_imm(img, x0, 0, x1 - x0, h).to_image();
+                    to_jpeg(&tile, edge)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("tile encoder panicked"))
+            .collect::<Result<Vec<_>>>()
+    })?;
+    Ok(jpegs
+        .into_iter()
+        .enumerate()
+        .map(|(i, jpeg)| {
+            let label = if n == 1 {
+                "Screen".to_string()
+            } else {
+                format!("Screen, part {}/{n} (left to right)", i + 1)
+            };
+            (label, jpeg)
+        })
+        .collect())
 }
 
 #[tokio::main]
@@ -158,6 +207,7 @@ struct Ctx {
     brain: brain::Brain,
     voice: voice::Voice,
     width: u32,
+    tiles: u32,
 }
 
 async fn start_camera(args: &Args) -> Option<camera::Camera> {
@@ -225,6 +275,7 @@ async fn run(args: Args) -> Result<()> {
         ),
         voice,
         width: args.width,
+        tiles: args.tiles,
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ipc::Cmd>();
@@ -350,17 +401,24 @@ async fn narrate(
     instruction: &str,
 ) -> Result<Option<String>> {
     let t = Instant::now();
-    let frame = screen::capture().context("screen capture")?;
-    let mut images = vec![("Screen", to_jpeg(&frame, ctx.width)?)];
+    // Capture and encoding are CPU-bound; keep them off the async thread so commands that cancel
+    // this narration are still seen promptly.
+    let (edge, tiles) = (ctx.width, ctx.tiles);
+    let mut images = tokio::task::spawn_blocking(move || {
+        let frame = screen::capture().context("screen capture")?;
+        screen_tiles(&frame, edge, tiles)
+    })
+    .await??;
     if let Some(cam) = camera {
         match cam.latest(Duration::from_secs(3)) {
-            Some(jpeg) => images.push(("Webcam", shrink(&jpeg, 640)?)),
+            Some(jpeg) => images.push(("Webcam".to_string(), shrink(&jpeg, 640)?)),
             None => tracing::warn!("no fresh webcam frame, sending screen only"),
         }
     }
     tracing::info!(
         ms = t.elapsed().as_millis() as u64,
         images = images.len(),
+        kb = images.iter().map(|(_, j)| j.len()).sum::<usize>() / 1024,
         "captured+encoded"
     );
 
@@ -389,6 +447,27 @@ async fn wait_ready(voice: &voice::Voice, lookahead: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_screens_split_into_readable_tiles() {
+        let wide = image::RgbImage::new(5120, 2160);
+        let tiles = screen_tiles(&wide, 1568, 0).unwrap();
+        assert_eq!(tiles.len(), 2);
+        assert!(tiles[0].0.contains("1/2") && tiles[1].0.contains("2/2"));
+        let t = image::load_from_memory(&tiles[0].1).unwrap();
+        // each 2560x2160 half is limited by its width: 1568/2560 = 0.61x
+        assert_eq!((t.width(), t.height()), (1568, 1323));
+    }
+
+    #[test]
+    fn narrow_screens_stay_one_tile_and_never_upscale() {
+        let small = image::RgbImage::new(1280, 720);
+        let tiles = screen_tiles(&small, 1568, 0).unwrap();
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0].0, "Screen");
+        let t = image::load_from_memory(&tiles[0].1).unwrap();
+        assert_eq!((t.width(), t.height()), (1280, 720));
+    }
 
     #[test]
     fn shrink_keeps_aspect_ratio() {
