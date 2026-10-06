@@ -22,6 +22,9 @@ struct Args {
     /// Longest edge of the screen frame sent to the model.
     #[arg(long, default_value_t = 768)]
     width: u32,
+    /// Send N requests on one HTTP client (one capture each) to measure warm-connection latency.
+    #[arg(long, default_value_t = 1)]
+    repeat: u32,
 }
 
 fn to_jpeg(img: &image::RgbImage, edge: u32) -> Result<Vec<u8>> {
@@ -48,23 +51,26 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
-    let t = Instant::now();
-    let frame = screen::capture().context("screen capture")?;
-    tracing::info!(
-        ms = t.elapsed().as_millis() as u64,
-        w = frame.width(),
-        h = frame.height(),
-        "captured"
-    );
-    let jpeg = to_jpeg(&frame, args.width)?;
-    tracing::info!(
-        ms = t.elapsed().as_millis() as u64,
-        bytes = jpeg.len(),
-        "encoded"
-    );
-
     let brain = brain::Brain::new(args.api_key, args.model);
-    brain
-        .narrate(SYSTEM, &[], &[jpeg], |s| println!("{s}"))
-        .await
+    for i in 0..args.repeat {
+        tracing::info!(run = i + 1, "---");
+        let t = Instant::now();
+        let frame = screen::capture().context("screen capture")?;
+        tracing::info!(
+            ms = t.elapsed().as_millis() as u64,
+            w = frame.width(),
+            h = frame.height(),
+            "captured"
+        );
+        let jpeg = to_jpeg(&frame, args.width)?;
+        tracing::info!(
+            ms = t.elapsed().as_millis() as u64,
+            bytes = jpeg.len(),
+            "encoded"
+        );
+        brain
+            .narrate(SYSTEM, &[], &[jpeg], |s| println!("{s}"))
+            .await?;
+    }
+    Ok(())
 }
