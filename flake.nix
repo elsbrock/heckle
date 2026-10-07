@@ -106,6 +106,8 @@
         program = lib.getExe narrator;
       };
 
+      homeManagerModules.default = import ./nix/hm-module.nix self;
+
       overlays.default = final: _prev: { narrator = self.packages.${final.system}.default; };
 
       devShells.${system}.default = pkgs.mkShell {
