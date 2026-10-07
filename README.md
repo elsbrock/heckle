@@ -158,3 +158,7 @@ cargo run
 
 Works on the author's machine, which is a bold claim in itself. The tray menu is known to be
 unreliable on some shells; the CLI and keybindings are the dependable way in.
+
+## License
+
+[MIT](LICENSE).

@@ -80,6 +80,7 @@
           meta = {
             description = "Live documentary-style commentator for your screen and webcam";
             mainProgram = "heckle";
+            license = lib.licenses.mit;
             platforms = [ system ];
           };
         } ''
