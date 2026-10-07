@@ -100,14 +100,14 @@ pub fn socket_path() -> PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    dir.join("narrator.sock")
+    dir.join("heckle.sock")
 }
 
 /// Send one line to the running daemon and return its one-line reply.
 pub async fn send(line: &str) -> Result<String> {
     let mut stream = UnixStream::connect(socket_path())
         .await
-        .context("narrator daemon is not running (start it with `narrator`)")?;
+        .context("heckle daemon is not running (start it with `heckle`)")?;
     stream.write_all(format!("{line}\n").as_bytes()).await?;
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply).await?;
@@ -125,7 +125,7 @@ pub async fn serve(tx: mpsc::UnboundedSender<Cmd>, status: watch::Receiver<Statu
     if path.exists() {
         if UnixStream::connect(&path).await.is_ok() {
             bail!(
-                "another narrator daemon is already running ({})",
+                "another heckle daemon is already running ({})",
                 path.display()
             );
         }

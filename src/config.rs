@@ -1,4 +1,4 @@
-//! `~/.config/narrator/config.toml`: every field is optional, and a missing file means defaults.
+//! `~/.config/heckle/config.toml`: every field is optional, and a missing file means defaults.
 //! The daemon re-reads it when it changes, so edits apply without a restart.
 
 use std::path::PathBuf;
@@ -6,11 +6,11 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// What makes the narrator speak.
+/// What makes heckle speak.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Trigger {
-    /// Only when asked (`narrator poke`, a hotkey, or the tray).
+    /// Only when asked (`heckle poke`, a hotkey, or the tray).
     #[default]
     Manual,
     /// Every `interval_secs` (with jitter), measured from the end of the previous line.
@@ -127,7 +127,7 @@ pub fn path() -> Result<PathBuf> {
         Some(d) => PathBuf::from(d),
         None => PathBuf::from(std::env::var("HOME").context("HOME is not set")?).join(".config"),
     };
-    Ok(dir.join("narrator/config.toml"))
+    Ok(dir.join("heckle/config.toml"))
 }
 
 /// Read the config; a missing file is not an error.

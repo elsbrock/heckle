@@ -92,7 +92,7 @@ fn source_chain(target: Option<&str>, mode: Mode) -> String {
 }
 
 /// A window showing the live camera. It is a second reader of the shared PipeWire camera, so
-/// it does not interfere with the narrator's own pipeline.
+/// it does not interfere with heckle's own pipeline.
 pub struct Preview {
     child: Child,
 }

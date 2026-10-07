@@ -13,11 +13,11 @@ pub struct Tray {
 
 impl ksni::Tray for Tray {
     fn id(&self) -> String {
-        "narrator".into()
+        "heckle".into()
     }
 
     fn title(&self) -> String {
-        "narrator".into()
+        "heckle".into()
     }
 
     fn icon_name(&self) -> String {

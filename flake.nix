@@ -1,5 +1,5 @@
 {
-  description = "narrator: live screen + webcam commentator";
+  description = "heckle: live screen + webcam commentator";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -40,26 +40,26 @@
       '';
 
       desktopItem = pkgs.makeDesktopItem {
-        name = "narrator";
-        desktopName = "Narrator";
+        name = "heckle";
+        desktopName = "Heckle";
         genericName = "Screen commentator";
         comment = "Live documentary-style commentary on your screen and webcam";
-        exec = "narrator";
-        icon = "narrator";
+        exec = "heckle";
+        icon = "heckle";
         terminal = false;
         categories = [ "AudioVideo" "Audio" ];
-        keywords = [ "narrator" "commentary" "speech" "webcam" ];
+        keywords = [ "heckle" "commentary" "speech" "webcam" ];
         actions = {
-          poke = { name = "Narrate now"; exec = "narrator poke"; };
-          stop = { name = "Stop speaking"; exec = "narrator stop"; };
-          toggle = { name = "Toggle on/off"; exec = "narrator toggle"; };
+          poke = { name = "Narrate now"; exec = "heckle poke"; };
+          stop = { name = "Stop speaking"; exec = "heckle stop"; };
+          toggle = { name = "Toggle on/off"; exec = "heckle toggle"; };
         };
       };
 
-      # The compiled binary alone; wrapping and desktop files live in `narrator` below so that
+      # The compiled binary alone; wrapping and desktop files live in `heckle` below so that
       # touching them does not recompile everything.
-      narratorBin = pkgs.rustPlatform.buildRustPackage {
-        pname = "narrator-unwrapped";
+      heckleBin = pkgs.rustPlatform.buildRustPackage {
+        pname = "heckle-unwrapped";
         version = "0.1.0";
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
@@ -71,44 +71,44 @@
           { name = sherpaArchive; path = sherpaLibs; }
         ];
 
-        meta.mainProgram = "narrator";
+        meta.mainProgram = "heckle";
       };
 
-      narrator = pkgs.runCommand "narrator-${narratorBin.version}"
+      heckle = pkgs.runCommand "heckle-${heckleBin.version}"
         {
           nativeBuildInputs = [ pkgs.makeWrapper ];
           meta = {
             description = "Live documentary-style commentator for your screen and webcam";
-            mainProgram = "narrator";
+            mainProgram = "heckle";
             platforms = [ system ];
           };
         } ''
         mkdir -p $out/share/applications $out/share/icons/hicolor/scalable/apps
-        makeWrapper ${narratorBin}/bin/narrator $out/bin/narrator \
+        makeWrapper ${heckleBin}/bin/heckle $out/bin/heckle \
           --prefix PATH : ${lib.makeBinPath runtimeDeps} \
           --prefix GST_PLUGIN_SYSTEM_PATH_1_0 : ${lib.makeSearchPathOutput "out" "lib/gstreamer-1.0" runtimeDeps} \
-          --set-default NARRATOR_VOICE_DIR ${kokoroModel}
-        install -Dm644 ${./assets/narrator.svg} \
-          $out/share/icons/hicolor/scalable/apps/narrator.svg
-        install -Dm644 ${desktopItem}/share/applications/narrator.desktop \
-          $out/share/applications/narrator.desktop
+          --set-default HECKLE_VOICE_DIR ${kokoroModel}
+        install -Dm644 ${./assets/heckle.svg} \
+          $out/share/icons/hicolor/scalable/apps/heckle.svg
+        install -Dm644 ${desktopItem}/share/applications/heckle.desktop \
+          $out/share/applications/heckle.desktop
       '';
     in
     {
       packages.${system} = {
-        default = narrator;
-        inherit narrator;
+        default = heckle;
+        inherit heckle;
         kokoro-model = kokoroModel;
       };
 
       apps.${system}.default = {
         type = "app";
-        program = lib.getExe narrator;
+        program = lib.getExe heckle;
       };
 
       homeManagerModules.default = import ./nix/hm-module.nix self;
 
-      overlays.default = final: _prev: { narrator = self.packages.${final.system}.default; };
+      overlays.default = final: _prev: { heckle = self.packages.${final.system}.default; };
 
       devShells.${system}.default = pkgs.mkShell {
         packages = with pkgs; [

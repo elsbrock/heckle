@@ -72,8 +72,8 @@ struct Args {
     #[arg(long, env = "OPENROUTER_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
     /// Shell command that prints the API key (e.g. `op read op://vault/item/field`); used when
-    /// no key is given directly. Without either, `~/.config/narrator/api-key` is read.
-    #[arg(long, env = "NARRATOR_API_KEY_CMD")]
+    /// no key is given directly. Without either, `~/.config/heckle/api-key` is read.
+    #[arg(long, env = "HECKLE_API_KEY_CMD")]
     api_key_cmd: Option<String>,
     /// OpenRouter model id; overrides `[model] id` in the config file.
     #[arg(long)]
@@ -95,7 +95,7 @@ struct Args {
     #[arg(long)]
     no_camera: bool,
     /// Camera to use: part of its name (e.g. "insta"); default is PipeWire's default source.
-    #[arg(long, env = "NARRATOR_CAMERA")]
+    #[arg(long, env = "HECKLE_CAMERA")]
     camera_target: Option<String>,
     /// Start the next look when this much audio is left, to hide the model's latency.
     #[arg(long, default_value_t = 1500)]
@@ -106,8 +106,8 @@ struct Args {
     /// Kokoro model directory.
     #[arg(
         long,
-        env = "NARRATOR_VOICE_DIR",
-        default_value = "~/.cache/narrator/models/kokoro-en-v0_19"
+        env = "HECKLE_VOICE_DIR",
+        default_value = "~/.cache/heckle/models/kokoro-en-v0_19"
     )]
     voice_dir: String,
     /// Kokoro speaker id (9 = bm_george, 10 = bm_lewis, 5 = am_adam).
@@ -187,7 +187,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "narrator=info".into()),
+                .unwrap_or_else(|_| "heckle=info".into()),
         )
         .init();
     let cli = Cli::parse();
@@ -321,12 +321,12 @@ async fn resolve_api_key(args: &Args) -> Result<String> {
         Some(d) => std::path::PathBuf::from(d),
         None => std::path::PathBuf::from(std::env::var("HOME")?).join(".config"),
     };
-    let path = dir.join("narrator/api-key");
+    let path = dir.join("heckle/api-key");
     std::fs::read_to_string(&path)
         .map(|k| k.trim().to_string())
         .with_context(|| {
             format!(
-                "no API key: set OPENROUTER_API_KEY or NARRATOR_API_KEY_CMD, or put it in {}",
+                "no API key: set OPENROUTER_API_KEY or HECKLE_API_KEY_CMD, or put it in {}",
                 path.display()
             )
         })

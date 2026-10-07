@@ -118,7 +118,7 @@ pub fn capture() -> Result<RgbImage> {
     let (format, width, height, stride) = state.format.context("no shm buffer offered")?;
 
     let size = (stride * height) as usize;
-    let fd = memfd_create("narrator", MemfdFlags::CLOEXEC)?;
+    let fd = memfd_create("heckle", MemfdFlags::CLOEXEC)?;
     ftruncate(&fd, size as u64)?;
     let map = unsafe { MmapMut::map_mut(&fd)? };
     let pool = shm.create_pool(fd.as_fd(), size as i32, &qh, ());

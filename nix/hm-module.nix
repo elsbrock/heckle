@@ -1,21 +1,21 @@
-# Home Manager module: `programs.narrator`. Writes ~/.config/narrator/config.toml; the daemon
+# Home Manager module: `programs.heckle`. Writes ~/.config/heckle/config.toml; the daemon
 # reloads it live. The API key is deliberately not an option (it would end up in the store):
-# use OPENROUTER_API_KEY, NARRATOR_API_KEY_CMD or ~/.config/narrator/api-key.
+# use OPENROUTER_API_KEY, HECKLE_API_KEY_CMD or ~/.config/heckle/api-key.
 self:
 { config, lib, pkgs, ... }:
 let
-  cfg = config.programs.narrator;
+  cfg = config.programs.heckle;
   toml = pkgs.formats.toml { };
 in
 {
-  options.programs.narrator = {
-    enable = lib.mkEnableOption "narrator, a live screen and webcam commentator";
+  options.programs.heckle = {
+    enable = lib.mkEnableOption "heckle, a live screen and webcam commentator";
 
     package = lib.mkOption {
       type = lib.types.package;
       default = self.packages.${pkgs.system}.default;
-      defaultText = lib.literalExpression "narrator.packages.\${pkgs.system}.default";
-      description = "The narrator package to install.";
+      defaultText = lib.literalExpression "heckle.packages.\${pkgs.system}.default";
+      description = "The heckle package to install.";
     };
 
     settings = lib.mkOption {
@@ -34,8 +34,8 @@ in
 
   config = lib.mkIf cfg.enable {
     home.packages = [ cfg.package ];
-    xdg.configFile."narrator/config.toml" = lib.mkIf (cfg.settings != { }) {
-      source = toml.generate "narrator-config.toml" cfg.settings;
+    xdg.configFile."heckle/config.toml" = lib.mkIf (cfg.settings != { }) {
+      source = toml.generate "heckle-config.toml" cfg.settings;
     };
   };
 }
