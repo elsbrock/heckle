@@ -1,5 +1,6 @@
 mod brain;
 mod camera;
+mod config;
 mod ipc;
 mod screen;
 mod tray;
@@ -12,14 +13,6 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use image::{ImageFormat, imageops::FilterType};
 use tokio::sync::{mpsc, watch};
-
-const SYSTEM: &str = "You are Sir David Attenborough narrating a nature documentary. The subject is a human \
-at its workstation. You get the screen and, when available, a webcam image of the human. \
-Observe their behaviour, mood and what is on screen with hushed wonder and dry British wit. \
-Speak in ONE sentence of at most 15 words, present tense, as spoken narration: no markdown, no emoji. \
-Be specific to what you see and never repeat your earlier lines. \
-Never read out passwords, tokens or private message contents. \
-If nothing has meaningfully changed, reply exactly: SILENCE";
 
 #[derive(Parser)]
 #[command(about = "Live documentary-style commentator for your screen and webcam")]
@@ -82,8 +75,9 @@ struct Args {
     /// no key is given directly. Without either, `~/.config/narrator/api-key` is read.
     #[arg(long, env = "NARRATOR_API_KEY_CMD")]
     api_key_cmd: Option<String>,
-    #[arg(long, default_value = "anthropic/claude-haiku-4.5")]
-    model: String,
+    /// OpenRouter model id; overrides `[model] id` in the config file.
+    #[arg(long)]
+    model: Option<String>,
     /// Longest edge of each screen tile sent to the model (Claude downsizes beyond ~1568).
     #[arg(long, default_value_t = 1568)]
     width: u32,
@@ -91,7 +85,7 @@ struct Args {
     /// (0 = automatic, one tile per ~2560 px of width).
     #[arg(long, default_value_t = 0)]
     tiles: u32,
-    /// Start in continuous mode (default: idle until `narrator poke`).
+    /// Start in continuous mode, overriding `[trigger] mode` in the config file.
     #[arg(long)]
     auto: bool,
     /// Open the webcam preview window at startup.
@@ -221,6 +215,7 @@ async fn main() -> Result<()> {
 
 struct Ctx {
     brain: brain::Brain,
+    system: String,
     voice: voice::Voice,
     width: u32,
     tiles: u32,
@@ -350,8 +345,16 @@ async fn run(args: Args) -> Result<()> {
         return Ok(());
     }
 
-    let ctx = Ctx {
-        brain: brain::Brain::new(resolve_api_key(&args).await?, args.model.clone()),
+    let config_path = config::path()?;
+    let mut cfg = config::load(&config_path)?;
+    let mut config_mtime = mtime(&config_path);
+    let mut config_checked = Instant::now();
+    let mut ctx = Ctx {
+        brain: brain::Brain::new(
+            resolve_api_key(&args).await?,
+            args.model.clone().unwrap_or_else(|| cfg.model.id.clone()),
+        ),
+        system: cfg.system_prompt(),
         voice,
         width: args.width,
         tiles: args.tiles,
@@ -360,7 +363,7 @@ async fn run(args: Args) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ipc::Cmd>();
     let mut status = ipc::Status {
         enabled: true,
-        auto: args.auto,
+        auto: args.auto || cfg.trigger.mode != config::Trigger::Manual,
         preview: false,
     };
     let (status_tx, status_rx) = watch::channel(status);
@@ -390,6 +393,29 @@ async fn run(args: Args) -> Result<()> {
     tracing::info!(socket = %ipc::socket_path().display(), auto = status.auto, "ready");
 
     loop {
+        if config_checked.elapsed() >= Duration::from_secs(1) {
+            config_checked = Instant::now();
+            let m = mtime(&config_path);
+            if m != config_mtime {
+                config_mtime = m;
+                match config::load(&config_path) {
+                    Ok(new) => {
+                        if new.trigger.mode != cfg.trigger.mode {
+                            status.auto = new.trigger.mode != config::Trigger::Manual;
+                            publish(&status_tx, &tray, status).await;
+                        }
+                        if args.model.is_none() {
+                            ctx.brain.model = new.model.id.clone();
+                        }
+                        ctx.system = new.system_prompt();
+                        cfg = new;
+                        tracing::info!("config reloaded");
+                    }
+                    // keep running on the last good config
+                    Err(e) => tracing::warn!("config not reloaded: {e:#}"),
+                }
+            }
+        }
         if preview.as_mut().is_some_and(|p| !p.is_running()) {
             preview = None; // the window was closed
             status.preview = false;
@@ -481,7 +507,12 @@ async fn run(args: Args) -> Result<()> {
             }
         };
         match outcome {
-            Some(Ok(Some(line))) => history.push(line),
+            Some(Ok(Some(line))) => {
+                history.push(line);
+                if cfg.trigger.mode == config::Trigger::Timer {
+                    not_before = Instant::now() + timer_delay(&cfg.trigger);
+                }
+            }
             Some(Ok(None)) => not_before = Instant::now() + Duration::from_secs(3),
             Some(Err(e)) => {
                 tracing::warn!("narration failed: {e:#}");
@@ -494,6 +525,22 @@ async fn run(args: Args) -> Result<()> {
     ctx.voice.stop();
     let _ = std::fs::remove_file(ipc::socket_path());
     Ok(())
+}
+
+fn mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// The quiet time before the next look in timer mode: the interval, varied by up to `jitter_pct`.
+fn timer_delay(t: &config::TriggerConfig) -> Duration {
+    let base = t.interval_secs.max(1) as f64;
+    let jitter = t.jitter_pct.min(100) as f64 / 100.0;
+    // Clock noise is random enough to keep the interval from being metronomic.
+    let noise = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos()) as f64
+        / 1e9;
+    Duration::from_secs_f64(base * (1.0 + jitter * (2.0 * noise - 1.0)))
 }
 
 /// One look: capture, ask the model, speak clauses as they stream in.
@@ -528,7 +575,7 @@ async fn narrate(
 
     let (mut line, mut silent) = (String::new(), false);
     ctx.brain
-        .narrate(SYSTEM, recent, &images, instruction, |chunk| {
+        .narrate(&ctx.system, recent, &images, instruction, |chunk| {
             if silent || chunk.starts_with("SILENCE") {
                 silent = true;
                 return;
@@ -579,5 +626,18 @@ mod tests {
         let out = shrink(&src, 640).unwrap();
         let img = image::load_from_memory(&out).unwrap();
         assert_eq!((img.width(), img.height()), (640, 360));
+    }
+
+    #[test]
+    fn timer_delay_stays_within_jitter() {
+        let t = config::TriggerConfig {
+            interval_secs: 60,
+            jitter_pct: 25,
+            ..Default::default()
+        };
+        for _ in 0..50 {
+            let d = timer_delay(&t).as_secs_f64();
+            assert!((45.0..=75.0).contains(&d), "{d}");
+        }
     }
 }
