@@ -3,6 +3,10 @@
 A tiny daemon that watches your screen and your face, then says something about it. Out loud.
 Think nature documentary, except the wildlife is you at 2 a.m. rewriting the same function.
 
+<p align="center">
+  <img width="506" height="460" alt="heckle" src="https://github.com/user-attachments/assets/7f4d10ed-7ea6-4454-bee1-3f613f896cea" />
+</p>
+
 > *"Here we see the developer, alone in its natural habitat, opening the same file for the
 > fourth time. It will not find what it seeks."*
 
