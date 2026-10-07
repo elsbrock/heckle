@@ -11,10 +11,12 @@ Think nature documentary, except the wildlife is you at 2 a.m. rewriting the sam
 1. **Look.** Grabs your screen (wlr-screencopy, so no portal prompts and no notification
    banners) and, if you allow it, a webcam frame through PipeWire.
 2. **Think.** Sends the images to a vision model on [OpenRouter](https://openrouter.ai) with a
-   persona and your last few lines, so it doesn't repeat itself.
+   persona and your last few lines, so it doesn't repeat itself. (OpenRouter is there because
+   this was hacked together in one evening, not because it's the plan. See
+   [Contributing](#contributing).)
 3. **Speak.** Streams the answer into a local [Kokoro](https://github.com/k2-fsa/sherpa-onnx)
    voice, sentence by sentence, so it starts talking before the model has finished thinking.
-   The voice runs on your machine. The pictures do not stay there (see [Privacy](#privacy)).
+   The voice runs on your machine. For now the pictures do not stay there (see [Privacy](#privacy)).
 
 If nothing interesting happened, the model says nothing. Not everyone gets that kind of restraint.
 
@@ -128,6 +130,17 @@ you pass `--no-camera`) to OpenRouter and the model provider behind it.** The sy
 the model not to read out passwords, tokens or private messages, but that's a request, not a
 guarantee. Don't run it over things you wouldn't show a stranger, and use `heckle toggle` before
 you open the password manager. The voice is local and nothing is stored by heckle itself.
+
+## Contributing
+
+**Local models are the big missing piece**, and PRs are very welcome. The model call is one small
+module (`src/brain.rs`) that streams chat completions from OpenRouter, so supporting anything that
+speaks the OpenAI-style API (Ollama, llama.cpp, LM Studio, vLLM) should mostly be a configurable
+base URL plus making the API key optional. A fully offline setup would also fix the
+[privacy](#privacy) caveat. Other things that would be nice: more personas, an app blocklist so it
+stays quiet around password managers, and compositors beyond wlroots.
+
+Open an issue first if you're planning something big.
 
 ## Development
 
