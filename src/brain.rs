@@ -58,6 +58,7 @@ impl Brain {
                 "max_tokens": 80,
                 "stream": true,
                 "provider": {"sort": "latency"},
+                "reasoning": {"enabled": false},
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": content},
